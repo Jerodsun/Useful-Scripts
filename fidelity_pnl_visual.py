@@ -1,20 +1,51 @@
 import pandas as pd
 import numpy as np
 import dash
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, State, callback_context
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import os
+import base64
+import io
 
 # Create the Dash application
 app = dash.Dash(__name__, title="Trading Activity Visualization")
 
-# Define the layout
+# Define the layout with file upload component
 app.layout = html.Div(
     [
         html.H1(
             "Trading Activity Analysis", style={"textAlign": "center", "margin": "20px"}
+        ),
+        html.Div(
+            [
+                html.H3(
+                    "Upload Fidelity Trades Export (CSV):",
+                    style={"marginBottom": "10px"},
+                ),
+                dcc.Upload(
+                    id="upload-data",
+                    children=html.Div(
+                        ["Drag and Drop or ", html.A("Select a CSV File")]
+                    ),
+                    style={
+                        "width": "100%",
+                        "height": "60px",
+                        "lineHeight": "60px",
+                        "borderWidth": "1px",
+                        "borderStyle": "dashed",
+                        "borderRadius": "5px",
+                        "textAlign": "center",
+                        "margin": "10px 0",
+                    },
+                    multiple=False,
+                ),
+                html.Div(
+                    id="upload-status", style={"margin": "10px 0", "color": "green"}
+                ),
+            ],
+            style={"margin": "20px"},
         ),
         html.Div(
             [
@@ -66,16 +97,53 @@ app.layout = html.Div(
             ],
             style={"margin": "30px"},
         ),
+        # Store the processed data as an intermediate value
+        dcc.Store(id="processed-data"),
     ]
 )
 
 
-def load_and_process_data(file_path):
-    """Load and process the trading data from CSV"""
-    df = pd.read_csv(file_path, skipinitialspace=True)
+def parse_uploaded_file(contents, filename):
+    """Parse and validate the uploaded file"""
+    content_type, content_string = contents.split(",")
+    decoded = base64.b64decode(content_string)
 
+    try:
+        if "csv" in filename.lower():
+            # Read the CSV file
+            df = pd.read_csv(
+                io.StringIO(decoded.decode("utf-8")), skipinitialspace=True
+            )
+            return process_fidelity_data(df), None
+        else:
+            return None, "Only CSV files are supported."
+    except Exception as e:
+        return None, f"Error processing file: {str(e)}"
+
+
+def process_fidelity_data(df):
+    """Process the uploaded Fidelity data"""
     # Clean up column names
     df.columns = [col.strip() for col in df.columns]
+
+    # Check if this is a valid Fidelity export
+    required_columns = [
+        "Run Date",
+        "Action",
+        "Symbol",
+        "Quantity",
+        "Price ($)",
+        "Amount ($)",
+    ]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+
+    if missing_columns:
+        cleaned_cols = [col.strip() for col in df.columns]
+        df.columns = cleaned_cols
+        # Try with cleaned column names
+        missing_columns = [col for col in required_columns if col not in cleaned_cols]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
 
     # Convert dates to datetime
     df["Run Date"] = pd.to_datetime(df["Run Date"], errors="coerce")
@@ -117,7 +185,7 @@ def load_and_process_data(file_path):
     df["is_option"] = df.apply(is_option, axis=1)
 
     # Filter out non-trade transactions
-    trade_types = ["buy", "sell", "short", "cover"]
+    trade_types = ["buy", "sell", "short", "cover", "unknown"]
     df = df[df["trade_type"].isin(trade_types)]
 
     # Calculate cumulative P&L
@@ -127,7 +195,7 @@ def load_and_process_data(file_path):
     # Calculate running sum of amounts (P&L)
     df["Cumulative P&L"] = df["Amount ($)"].cumsum()
 
-    return df
+    return df.to_dict("records")
 
 
 def generate_trade_markers(df, selected_trade_types, include_options):
@@ -189,16 +257,56 @@ def generate_trade_markers(df, selected_trade_types, include_options):
 
 
 @app.callback(
-    [Output("trading-graph", "figure"), Output("trading-stats", "children")],
-    [Input("timeframe-selector", "value"), Input("trade-type-filter", "value")],
+    Output("processed-data", "data"),
+    Output("upload-status", "children"),
+    Input("upload-data", "contents"),
+    State("upload-data", "filename"),
+    prevent_initial_call=True,
 )
-def update_graph(timeframe, selected_trade_types):
-    # Load data
-    file_path = "History_for_Account_Z09915588.csv"
-    df = load_and_process_data(file_path)
+def store_data(contents, filename):
+    """Process and store the uploaded file data"""
+    if contents is None:
+        return None, ""
+
+    data, error = parse_uploaded_file(contents, filename)
+
+    if error:
+        return None, html.Div(error, style={"color": "red"})
+    else:
+        return data, html.Div(
+            f"File '{filename}' uploaded successfully!", style={"color": "green"}
+        )
+
+
+@app.callback(
+    [Output("trading-graph", "figure"), Output("trading-stats", "children")],
+    [
+        Input("timeframe-selector", "value"),
+        Input("trade-type-filter", "value"),
+        Input("processed-data", "data"),
+    ],
+    prevent_initial_call=True,
+)
+def update_graph(timeframe, selected_trade_types, data):
+    """Update the graph based on filters and uploaded data"""
+    if data is None:
+        # Return empty figure and stats if no data
+        fig = go.Figure()
+        fig.update_layout(
+            title="No data available. Please upload a Fidelity CSV export file.",
+            xaxis_title="Date",
+            yaxis_title="Cumulative P&L ($)",
+        )
+        return fig, []
+
+    # Convert the dictionary data back to a DataFrame
+    df = pd.DataFrame(data)
+
+    # Convert dates back to datetime (as they were stored as strings in the dcc.Store)
+    df["Run Date"] = pd.to_datetime(df["Run Date"])
 
     # Filter by timeframe
-    if timeframe != "all":
+    if timeframe != "all" and not df.empty:
         end_date = df["Run Date"].max()
         if timeframe == "1m":
             start_date = end_date - pd.DateOffset(months=1)
@@ -210,6 +318,14 @@ def update_graph(timeframe, selected_trade_types):
 
     # Create the main figure
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    if df.empty:
+        fig.update_layout(
+            title="No data available for the selected timeframe.",
+            xaxis_title="Date",
+            yaxis_title="Cumulative P&L ($)",
+        )
+        return fig, []
 
     # Add the cumulative P&L line
     fig.add_trace(
@@ -365,6 +481,50 @@ def update_graph(timeframe, selected_trade_types):
     ]
 
     return fig, stats_boxes
+
+
+# Add a default view for when the app first loads
+@app.callback(
+    [
+        Output("trading-graph", "figure", allow_duplicate=True),
+        Output("trading-stats", "children", allow_duplicate=True),
+    ],
+    [Input("upload-data", "filename")],
+    prevent_initial_call="initial_duplicate",
+)
+def initial_view(filename):
+    if filename is not None:
+        # If a file has been uploaded, don't override the view
+        raise dash.exceptions.PreventUpdate
+
+    # Create empty figure with instructions
+    fig = go.Figure()
+    fig.update_layout(
+        title="Upload a Fidelity CSV export to visualize your trading activity",
+        xaxis_title="Date",
+        yaxis_title="Cumulative P&L ($)",
+        annotations=[
+            dict(
+                text="No data available. Please upload your Fidelity export file using the upload area above.",
+                showarrow=False,
+                xref="paper",
+                yref="paper",
+                x=0.5,
+                y=0.5,
+                font=dict(size=16),
+            )
+        ],
+    )
+
+    # Create empty stats section
+    empty_stats = html.Div(
+        html.P(
+            "Upload data to see trading statistics",
+            style={"textAlign": "center", "color": "#888"},
+        )
+    )
+
+    return fig, empty_stats
 
 
 if __name__ == "__main__":
